@@ -3,7 +3,7 @@
 
 use crate::{
     event,
-    inet::{SocketAddress, SocketAddressV4, SocketAddressV6},
+    inet::{IpV4Address, IpV6Address, SocketAddress, SocketAddressV4, SocketAddressV6},
 };
 use core::{
     convert::{TryFrom, TryInto},
@@ -92,6 +92,9 @@ pub trait Handle: 'static + Copy + Send + fmt::Debug {
     /// Returns the remote address for the given handle
     fn remote_address(&self) -> RemoteAddress;
 
+    /// Updates the remote port to the given value
+    fn set_remote_port(&mut self, port: u16);
+
     /// Returns the local address for the given handle
     fn local_address(&self) -> LocalAddress;
 
@@ -122,7 +125,22 @@ macro_rules! impl_addr {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
         #[cfg_attr(any(test, feature = "generator"), derive(TypeGenerator))]
+        #[cfg_attr(kani, derive(kani::Arbitrary))]
         pub struct $name(pub SocketAddress);
+
+        impl From<event::api::SocketAddress<'_>> for $name {
+            #[inline]
+            fn from(value: event::api::SocketAddress<'_>) -> Self {
+                match value {
+                    event::api::SocketAddress::IpV4 { ip, port } => {
+                        $name(IpV4Address::new(*ip).with_port(port).into())
+                    }
+                    event::api::SocketAddress::IpV6 { ip, port } => {
+                        $name(IpV6Address::new(*ip).with_port(port).into())
+                    }
+                }
+            }
+        }
 
         impl From<SocketAddress> for $name {
             #[inline]
@@ -177,6 +195,11 @@ impl Handle for RemoteAddress {
     }
 
     #[inline]
+    fn set_remote_port(&mut self, port: u16) {
+        self.0.set_port(port)
+    }
+
+    #[inline]
     fn local_address(&self) -> LocalAddress {
         SocketAddressV4::UNSPECIFIED.into()
     }
@@ -225,6 +248,11 @@ impl Handle for Tuple {
     #[inline]
     fn remote_address(&self) -> RemoteAddress {
         self.remote_address
+    }
+
+    #[inline]
+    fn set_remote_port(&mut self, port: u16) {
+        self.remote_address.set_port(port)
     }
 
     #[inline]

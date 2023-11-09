@@ -387,6 +387,7 @@ impl<'a, Config: endpoint::Config, Pub: event::ConnectionPublisher>
             Config::ENDPOINT_TYPE,
             self.limits.initial_flow_control_limits(),
             peer_flow_control_limits,
+            self.path_manager.active_path().rtt_estimator.min_rtt(),
         );
 
         let ack_manager = AckManager::new(
@@ -454,6 +455,17 @@ impl<'a, Config: endpoint::Config, Pub: event::ConnectionPublisher>
         );
         *self.application_protocol = application_protocol;
 
+        Ok(())
+    }
+
+    fn on_tls_exporter_ready(
+        &mut self,
+        session: &impl tls::TlsSession,
+    ) -> Result<(), transport::Error> {
+        self.publisher
+            .on_tls_exporter_ready(event::builder::TlsExporterReady {
+                session: s2n_quic_core::event::TlsSession::new(session),
+            });
         Ok(())
     }
 

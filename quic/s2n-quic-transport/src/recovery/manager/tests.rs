@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::{
-    ack::ack_ranges::AckRanges,
     connection::{ConnectionIdMapper, InternalConnectionIdGenerator},
     contexts::testing::{MockWriteContext, OutgoingFrameBuffer},
     endpoint::{
@@ -17,7 +16,7 @@ use crate::{
 use bolero::TypeGenerator;
 use core::{ops::RangeInclusive, time::Duration};
 use s2n_quic_core::{
-    connection,
+    ack, connection,
     event::testing::Publisher,
     frame::ack_elicitation::AckElicitation,
     inet::{DatagramInfo, ExplicitCongestionNotification, SocketAddress},
@@ -431,7 +430,8 @@ fn on_ack_frame() {
     assert_eq!(2, context.on_rtt_update_count);
 
     // Ack packet 10, but with a path that is not peer validated
-    context.path_manager[unsafe { path::Id::new(0) }] = Path::new(
+    let path_id = unsafe { path::Id::new(0) };
+    context.path_manager[path_id] = Path::new(
         Default::default(),
         connection::PeerId::TEST_ID,
         connection::LocalId::TEST_ID,
@@ -440,6 +440,7 @@ fn on_ack_frame() {
         false,
         DEFAULT_MAX_MTU,
     );
+    context.path_manager.activate_path_for_test(path_id);
     context.path_mut().pto_backoff = 2;
     let ack_receive_time = ack_receive_time + Duration::from_millis(500);
     ack_packets(
@@ -690,25 +691,18 @@ fn process_new_acked_packets_update_pto_timer() {
 #[test]
 // congestion_controller.on_packet_ack should be updated for the path the packet was sent on
 //
-// Setup 1:
+// Setup:
 // - create path manager with two validated paths
 // - send a packet on each path
 //  - packet 1 on path 1
 //  - packet 2 on path 2
 //
-// Trigger 1:
-// - send ack for packet 1 on path 1
+// Trigger:
+// - send ack for packet 1 and 2 on path 1
 //
-// Expectation 1:
-// - cc.on_packet_ack should be updated for first_path
-// - cc.on_packet_ack should not be updated for second_path
-//
-// Trigger 2:
-// - send ack for packet 2 on path 2
-//
-// Expectation 2:
-// - cc.on_packet_ack should not be updated for first_path
-// - cc.on_packet_ack should be updated for second_path
+// Expectation:
+// - cc.on_packet_ack should be incremented once for the first_path
+// - cc.on_packet_ack should be incremented once for the second_path
 fn process_new_acked_packets_congestion_controller() {
     // Setup:
     let space = PacketNumberSpace::ApplicationData;
@@ -755,11 +749,11 @@ fn process_new_acked_packets_congestion_controller() {
         &mut publisher,
     );
 
-    // Trigger 1:
-    // Ack packet 1 on path 1
+    // Trigger:
+    // Ack packets 1 and 2 on path 1
     let ack_receive_time = time_sent + Duration::from_millis(500);
     helper_ack_packets_on_path(
-        1..=1,
+        1..=2,
         ack_receive_time,
         &mut context,
         &mut manager,
@@ -768,36 +762,7 @@ fn process_new_acked_packets_congestion_controller() {
         &mut publisher,
     );
 
-    // Expectation 1:
-    assert_eq!(
-        context
-            .path_by_id(first_path_id)
-            .congestion_controller
-            .on_packet_ack,
-        1
-    );
-    assert_eq!(
-        context
-            .path_by_id(second_path_id)
-            .congestion_controller
-            .on_packet_ack,
-        0
-    );
-
-    // Trigger 2:
-    // Ack packet 2 on path 1
-    let ack_receive_time = time_sent + Duration::from_millis(500);
-    helper_ack_packets_on_path(
-        2..=2,
-        ack_receive_time,
-        &mut context,
-        &mut manager,
-        first_addr,
-        None,
-        &mut publisher,
-    );
-
-    // Expectation 2:
+    // Expectation:
     assert_eq!(
         context
             .path_by_id(first_path_id)
@@ -1835,31 +1800,37 @@ fn remove_lost_packets_persistent_congestion_path_aware() {
         space.new_packet_number(VarInt::from_u8(9)),
         space.new_packet_number(VarInt::from_u8(10)),
     );
-    manager.sent_packets.insert(
-        space.new_packet_number(VarInt::from_u8(9)),
-        SentPacketInfo::new(
-            true,
-            1,
-            now,
-            AckElicitation::Eliciting,
-            first_path_id,
-            ecn,
-            transmission::Mode::Normal,
-            Default::default(),
-        ),
+    context.set_path_id(first_path_id);
+    manager.on_packet_sent(
+        sent_packets_to_remove.start(),
+        Outcome {
+            ack_elicitation: AckElicitation::Eliciting,
+            is_congestion_controlled: true,
+            bytes_sent: 1,
+            bytes_progressed: 0,
+        },
+        now,
+        ecn,
+        transmission::Mode::Normal,
+        None,
+        &mut context,
+        &mut publisher,
     );
-    manager.sent_packets.insert(
-        space.new_packet_number(VarInt::from_u8(10)),
-        SentPacketInfo::new(
-            true,
-            1,
-            now,
-            AckElicitation::Eliciting,
-            second_path_id,
-            ecn,
-            transmission::Mode::Normal,
-            Default::default(),
-        ),
+    context.set_path_id(second_path_id);
+    manager.on_packet_sent(
+        sent_packets_to_remove.end(),
+        Outcome {
+            ack_elicitation: AckElicitation::Eliciting,
+            is_congestion_controlled: true,
+            bytes_sent: 1,
+            bytes_progressed: 0,
+        },
+        now,
+        ecn,
+        transmission::Mode::Normal,
+        None,
+        &mut context,
+        &mut publisher,
     );
 
     // Trigger:
@@ -2589,7 +2560,8 @@ fn update_pto_timer() {
         space,
     );
     // The path will be at the anti-amplification limit
-    context.path_mut().on_bytes_received(1200);
+    let amplification_outcome = context.path_mut().on_bytes_received(1200);
+    assert!(amplification_outcome.is_active_path_unblocked());
     context.path_mut().on_bytes_transmitted((1200 * 3) + 1);
     // Arm the PTO so we can verify it is cancelled
     manager.pto.timer.set(now + Duration::from_secs(10));
@@ -2619,7 +2591,8 @@ fn update_pto_timer() {
     assert!(!manager.pto_update_pending);
 
     // Reset the path back to not peer validated
-    context.path_manager[unsafe { path::Id::new(0) }] = Path::new(
+    let path_id = unsafe { path::Id::new(0) };
+    context.path_manager[path_id] = Path::new(
         Default::default(),
         connection::PeerId::TEST_ID,
         connection::LocalId::TEST_ID,
@@ -2628,6 +2601,7 @@ fn update_pto_timer() {
         false,
         DEFAULT_MAX_MTU,
     );
+    context.path_manager.activate_path_for_test(path_id);
     // simulate receiving a handshake packet to force path validation
     context.path_mut().on_handshake_packet();
     context.path_mut().pto_backoff = 2;
@@ -2709,8 +2683,9 @@ fn pto_armed_if_handshake_not_confirmed() {
     let mut manager = ServerManager::new(space);
     let now = time::now() + Duration::from_secs(10);
     let is_handshake_confirmed = false;
-
-    let mut path = Path::new(
+    let mut path_manager = helper_generate_path_manager(Duration::from_millis(10));
+    let path_id = unsafe { path::Id::new(0) };
+    path_manager[path_id] = Path::new(
         Default::default(),
         connection::PeerId::TEST_ID,
         connection::LocalId::TEST_ID,
@@ -2719,11 +2694,12 @@ fn pto_armed_if_handshake_not_confirmed() {
         false,
         DEFAULT_MAX_MTU,
     );
+    path_manager.activate_path_for_test(path_id);
 
     // simulate receiving a handshake packet to force path validation
-    path.on_handshake_packet();
+    path_manager[path_id].on_handshake_packet();
 
-    manager.update_pto_timer(&path, now, is_handshake_confirmed);
+    manager.update_pto_timer(&path_manager[path_id], now, is_handshake_confirmed);
 
     assert!(manager.pto.timer.is_armed());
 }
@@ -3167,10 +3143,11 @@ fn helper_ack_packets_on_path(
         payload_len: 0,
         ecn: Default::default(),
         destination_connection_id: connection::LocalId::TEST_ID,
+        destination_connection_id_classification: connection::id::Classification::Local,
         source_connection_id: None,
     };
 
-    let mut ack_range = AckRanges::new(acked_packets.count());
+    let mut ack_range = ack::Ranges::new(acked_packets.count());
 
     for acked_packet in acked_packets {
         assert!(ack_range.insert_packet_number(acked_packet).is_ok());
@@ -3452,6 +3429,7 @@ fn helper_generate_multi_path_manager(
             payload_len: 0,
             ecn: ExplicitCongestionNotification::default(),
             destination_connection_id: connection::LocalId::TEST_ID,
+            destination_connection_id_classification: connection::id::Classification::Local,
             source_connection_id: None,
         };
         let _ = path_manager
@@ -3521,7 +3499,7 @@ fn helper_generate_path_manager_with_first_addr(
         connection::PeerId::TEST_ID,
         connection::LocalId::TEST_ID,
         RttEstimator::new(max_ack_delay),
-        MockCongestionController::default(),
+        MockCongestionController::new(first_addr),
         true,
         DEFAULT_MAX_MTU,
     );
@@ -3542,7 +3520,7 @@ fn helper_generate_client_path_manager(
         connection::PeerId::TEST_ID,
         connection::LocalId::TEST_ID,
         RttEstimator::new(max_ack_delay),
-        MockCongestionController::default(),
+        MockCongestionController::new(first_addr),
         false,
         DEFAULT_MAX_MTU,
     );
@@ -3587,6 +3565,14 @@ impl<'a, Config: endpoint::Config> recovery::Context<Config> for MockContext<'a,
         true
     }
 
+    fn active_path(&self) -> &path::Path<Config> {
+        self.path_manager.active_path()
+    }
+
+    fn active_path_mut(&mut self) -> &mut path::Path<Config> {
+        self.path_manager.active_path_mut()
+    }
+
     fn path(&self) -> &super::Path<Config> {
         &self.path_manager[self.path_id]
     }
@@ -3611,6 +3597,7 @@ impl<'a, Config: endpoint::Config> recovery::Context<Config> for MockContext<'a,
         &mut self,
         _timestamp: Timestamp,
         _packet_number_range: &PacketNumberRange,
+        _lowest_tracking_packet_number: PacketNumber,
     ) -> Result<(), transport::Error> {
         self.validate_packet_ack_count += 1;
         Ok(())
@@ -3637,7 +3624,7 @@ impl<'a, Config: endpoint::Config> recovery::Context<Config> for MockContext<'a,
         self.lost_packets.insert(packet_number_range.start());
     }
 
-    fn on_rtt_update(&mut self) {
+    fn on_rtt_update(&mut self, _now: Timestamp) {
         self.on_rtt_update_count += 1;
     }
 }

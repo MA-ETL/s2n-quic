@@ -8,7 +8,7 @@ use crate::{
         self,
         limits::{ConnectionInfo as LimitsInfo, Limiter as _},
         ConnectionContainer, ConnectionContainerIterationResult, ConnectionIdMapper,
-        InternalConnectionId, InternalConnectionIdGenerator, ProcessingError, Trait as _,
+        InternalConnectionId, InternalConnectionIdGenerator, Trait as _,
     },
     endpoint,
     endpoint::close::CloseHandle,
@@ -102,7 +102,7 @@ impl<Cfg: Config> s2n_quic_core::endpoint::Endpoint for Endpoint<Cfg> {
     {
         let mut now: Option<Timestamp> = None;
 
-        queue.for_each(|header, payload| {
+        queue.for_each(|mut header, payload| {
             let timestamp = match now {
                 Some(time) => time,
                 None => {
@@ -111,7 +111,7 @@ impl<Cfg: Config> s2n_quic_core::endpoint::Endpoint for Endpoint<Cfg> {
                 }
             };
 
-            self.receive_datagram(&header, payload, timestamp)
+            self.receive_datagram(&mut header, payload, timestamp)
         });
     }
 
@@ -417,13 +417,11 @@ impl<Cfg: Config> Endpoint<Cfg> {
     /// Ingests a single datagram
     fn receive_datagram(
         &mut self,
-        header: &datagram::Header<Cfg::PathHandle>,
+        header: &mut datagram::Header<Cfg::PathHandle>,
         payload: &mut [u8],
         timestamp: Timestamp,
     ) {
         let endpoint_context = self.config.context();
-
-        let remote_address = header.path.remote_address();
 
         // Try to decode the first packet in the datagram
         let payload_len = payload.len();
@@ -431,6 +429,13 @@ impl<Cfg: Config> Endpoint<Cfg> {
 
         let buffer = {
             let subject = event::builder::Subject::Endpoint {}.into_event();
+
+            let mut port = header.path.remote_address().port();
+            endpoint_context
+                .packet_interceptor
+                .intercept_rx_remote_port(&subject, &mut port);
+            header.path.set_remote_port(port);
+
             let remote_address = header.path.remote_address();
             let local_address = header.path.local_address();
 
@@ -445,6 +450,7 @@ impl<Cfg: Config> Endpoint<Cfg> {
                 .intercept_rx_datagram(&subject, &datagram, buffer)
         };
 
+        let remote_address = header.path.remote_address();
         let connection_info = ConnectionInfo::new(&remote_address);
         let (packet, remaining) = if let Ok((packet, remaining)) = ProtectedPacket::decode(
             buffer,
@@ -527,11 +533,12 @@ impl<Cfg: Config> Endpoint<Cfg> {
             .source_connection_id()
             .and_then(PeerId::try_from_bytes);
 
-        let datagram = &DatagramInfo {
+        let mut datagram = DatagramInfo {
             timestamp,
             payload_len,
             ecn: header.ecn,
             destination_connection_id,
+            destination_connection_id_classification: connection::id::Classification::Initial,
             source_connection_id,
         };
 
@@ -540,12 +547,14 @@ impl<Cfg: Config> Endpoint<Cfg> {
 
         // Try to lookup the internal connection ID and dispatch the packet
         // to the Connection
-        if let Some(internal_id) = self
+        if let Some((internal_id, dcid_classification)) = self
             .connection_id_mapper
-            .lookup_internal_connection_id(&datagram.destination_connection_id)
+            .lookup_internal_connection_id(&destination_connection_id)
         {
             let mut check_for_stateless_reset = false;
             let max_mtu = self.max_mtu;
+
+            datagram.destination_connection_id_classification = dcid_classification;
 
             let _ = self.connections.with_connection(internal_id, |conn| {
                 // The path `Id` needs to be passed around instead of the path to get around `&mut self` and
@@ -553,7 +562,7 @@ impl<Cfg: Config> Endpoint<Cfg> {
                 let path_id = conn
                     .on_datagram_received(
                         &header.path,
-                        datagram,
+                        &datagram,
                         endpoint_context.congestion_controller,
                         endpoint_context.path_migration,
                         max_mtu,
@@ -575,78 +584,32 @@ impl<Cfg: Config> Endpoint<Cfg> {
                         );
                     })?;
 
-                //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.1
-                //# An endpoint
-                //# that is closing is not required to process any received frame.
-
                 if let Err(err) = conn.handle_packet(
-                    datagram,
+                    &datagram,
                     path_id,
                     packet,
                     endpoint_context.random_generator,
                     endpoint_context.event_subscriber,
                     endpoint_context.packet_interceptor,
                     endpoint_context.datagram,
+                    &mut check_for_stateless_reset,
                 ) {
-                    match err {
-                        ProcessingError::DuplicatePacket => {
-                            // We discard duplicate packets
-                        }
-                        ProcessingError::NonEmptyRetryToken => {
-                            //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.2
-                            //# Initial packets sent by the server MUST set the Token Length field
-                            //# to 0; clients that receive an Initial packet with a non-zero Token
-                            //# Length field MUST either discard the packet or generate a
-                            //# connection error of type PROTOCOL_VIOLATION.
-                            //
-                            // We discard server initials with non empty retry tokens instead of closing
-                            // the connection to prevent an attacker that can spoof initial packets
-                            // from gaining the ability to close a connection by setting a retry token.
-                        }
-                        ProcessingError::RetryScidEqualsDcid => {
-                            //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.1
-                            //# A client MUST
-                            //# discard a Retry packet that contains a Source Connection ID field
-                            //# that is identical to the Destination Connection ID field of its
-                            //# Initial packet.
-                        }
-                        ProcessingError::ConnectionError(err) => {
-                            conn.close(
-                                err,
-                                endpoint_context.connection_close_formatter,
-                                close_packet_buffer,
-                                datagram.timestamp,
-                                endpoint_context.event_subscriber,
-                                endpoint_context.packet_interceptor,
-                            );
-                            return Err(());
-                        }
-                        ProcessingError::CryptoError(_) => {
-                            // CryptoErrors returned as a result of a packet failing decryption
-                            // will be silently discarded, but are a potential indication of a
-                            // stateless reset from the peer
-
-                            //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.1
-                            //# Due to packet reordering or loss, a client might receive packets for
-                            //# a connection that are encrypted with a key it has not yet computed.
-                            //# The client MAY drop these packets, or it MAY buffer them in
-                            //# anticipation of later packets that allow it to compute the key.
-                            //
-                            // Packets that fail decryption are discarded rather than buffered.
-
-                            //= https://www.rfc-editor.org/rfc/rfc9000#section-10.3.1
-                            //# Endpoints MAY skip this check if any packet from a datagram is
-                            //# successfully processed.  However, the comparison MUST be performed
-                            //# when the first packet in an incoming datagram either cannot be
-                            //# associated with a connection, or cannot be decrypted.
-                            check_for_stateless_reset = true;
-                        }
-                    }
+                    //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.1
+                    //# An endpoint
+                    //# that is closing is not required to process any received frame.
+                    conn.close(
+                        err,
+                        endpoint_context.connection_close_formatter,
+                        close_packet_buffer,
+                        datagram.timestamp,
+                        endpoint_context.event_subscriber,
+                        endpoint_context.packet_interceptor,
+                    );
                 }
 
                 if let Err(err) = conn.handle_remaining_packets(
                     &header.path,
-                    datagram,
+                    &datagram,
                     path_id,
                     endpoint_context.connection_id_format,
                     remaining,
@@ -654,7 +617,11 @@ impl<Cfg: Config> Endpoint<Cfg> {
                     endpoint_context.event_subscriber,
                     endpoint_context.packet_interceptor,
                     endpoint_context.datagram,
+                    &mut check_for_stateless_reset,
                 ) {
+                    //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.1
+                    //# An endpoint
+                    //# that is closing is not required to process any received frame.
                     conn.close(
                         err,
                         endpoint_context.connection_close_formatter,
@@ -766,7 +733,7 @@ impl<Cfg: Config> Endpoint<Cfg> {
 
                 if let Err(err) = self.handle_initial_packet(
                     header,
-                    datagram,
+                    &datagram,
                     packet,
                     remaining,
                     retry_token_dcid,
@@ -823,7 +790,7 @@ impl<Cfg: Config> Endpoint<Cfg> {
                     && Cfg::StatelessResetTokenGenerator::ENABLED
                     && is_short_header_packet
                 {
-                    self.enqueue_stateless_reset(header, datagram, &destination_connection_id);
+                    self.enqueue_stateless_reset(header, &datagram, &destination_connection_id);
                 }
             }
         }

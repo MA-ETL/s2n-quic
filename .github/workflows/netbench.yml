@@ -30,7 +30,7 @@ jobs:
   rustfmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: actions-rs/toolchain@v1.0.7
         id: toolchain
@@ -57,7 +57,7 @@ jobs:
             args: "-D warnings"
           - toolchain: beta
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: actions-rs/toolchain@v1.0.7
         id: toolchain
@@ -81,7 +81,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           lfs: true
 
@@ -115,7 +115,7 @@ jobs:
     outputs:
       scenarios: ${{ steps.scenarios.outputs.scenarios }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: actions-rs/toolchain@v1.0.7
         id: toolchain
@@ -228,7 +228,7 @@ jobs:
           name: netbench-report
           path: reports
 
-      - uses: aws-actions/configure-aws-credentials@v3.0.1
+      - uses: aws-actions/configure-aws-credentials@v4.0.1
         if: github.event_name == 'push' || github.repository == github.event.pull_request.head.repo.full_name
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}

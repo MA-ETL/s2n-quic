@@ -178,7 +178,11 @@ impl<Config: endpoint::Config> Manager<Config> {
                     context,
                     publisher,
                 );
-                self.update_pto_timer(context.path(), timestamp, context.is_handshake_confirmed());
+                self.update_pto_timer(
+                    context.active_path(),
+                    timestamp,
+                    context.is_handshake_confirmed(),
+                );
             }
         } else {
             let pto_expired = self
@@ -193,13 +197,17 @@ impl<Config: endpoint::Config> Manager<Config> {
             //# When a PTO timer expires, the PTO backoff MUST be increased,
             //# resulting in the PTO period being set to twice its current value.
             if pto_expired {
-                context.path_mut().pto_backoff =
-                    (context.path().pto_backoff * 2).min(max_pto_backoff);
-                self.update_pto_timer(context.path(), timestamp, context.is_handshake_confirmed());
+                context.active_path_mut().pto_backoff =
+                    (context.active_path().pto_backoff * 2).min(max_pto_backoff);
+                self.update_pto_timer(
+                    context.active_path(),
+                    timestamp,
+                    context.is_handshake_confirmed(),
+                );
             }
         }
 
-        self.check_consistency(context.path(), context.is_handshake_confirmed());
+        self.check_consistency(context.active_path(), context.is_handshake_confirmed());
 
         let path_id = context.path_id().as_u8();
         let path = context.path_mut();
@@ -290,11 +298,13 @@ impl<Config: endpoint::Config> Manager<Config> {
     /// Updates the PTO timer
     pub fn update_pto_timer(
         &mut self,
-        path: &Path<Config>,
+        active_path: &Path<Config>,
         now: Timestamp,
         is_handshake_confirmed: bool,
     ) {
         self.pto_update_pending = false;
+
+        debug_assert!(active_path.is_active());
 
         (|| {
             if self.loss_timer.is_armed() {
@@ -311,7 +321,7 @@ impl<Config: endpoint::Config> Manager<Config> {
             //# If no additional data can be sent, the server's PTO timer MUST NOT be
             //# armed until datagrams have been received from the client, because
             //# packets sent on PTO count against the anti-amplification limit.
-            if path.at_amplification_limit() {
+            if active_path.at_amplification_limit() {
                 // The server's timer is not set if nothing can be sent.
                 self.pto.cancel();
                 return;
@@ -333,7 +343,7 @@ impl<Config: endpoint::Config> Manager<Config> {
             //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2.1
             //# it is the client's responsibility to send packets to unblock the server
             //# until it is certain that the server has finished its address validation
-            if !ack_eliciting_packets_in_flight && path.is_peer_validated() {
+            if !ack_eliciting_packets_in_flight && active_path.is_peer_validated() {
                 // There is nothing to detect lost, so no timer is set.
                 // However, the client needs to arm the timer if the
                 // server might be blocked by the anti-amplification limit.
@@ -356,10 +366,10 @@ impl<Config: endpoint::Config> Manager<Config> {
             };
 
             self.pto
-                .update(pto_base_timestamp, path.pto_period(self.space));
+                .update(pto_base_timestamp, active_path.pto_period(self.space));
         })();
 
-        self.check_consistency(path, is_handshake_confirmed);
+        self.check_consistency(active_path, is_handshake_confirmed);
     }
 
     /// Queries the component for any outgoing frames that need to get sent
@@ -401,7 +411,7 @@ impl<Config: endpoint::Config> Manager<Config> {
             publisher,
         )?;
 
-        self.check_consistency(context.path(), context.is_handshake_confirmed());
+        self.check_consistency(context.active_path(), context.is_handshake_confirmed());
 
         Ok(())
     }
@@ -429,9 +439,8 @@ impl<Config: endpoint::Config> Manager<Config> {
             }
         };
 
-        let mut newly_acked_packets = SmallVec::<
-            [SentPacketInfo<packet_info_type!()>; ACKED_PACKETS_INITIAL_CAPACITY],
-        >::new();
+        let mut newly_acked_packets =
+            SmallVec::<[PacketDetails<packet_info_type!()>; ACKED_PACKETS_INITIAL_CAPACITY]>::new();
         let (largest_newly_acked, includes_ack_eliciting) = self.process_ack_range(
             &mut newly_acked_packets,
             timestamp,
@@ -459,10 +468,8 @@ impl<Config: endpoint::Config> Manager<Config> {
                 publisher,
             );
 
-            let (_, largest_newly_acked_info) = largest_newly_acked;
             self.process_new_acked_packets(
                 &newly_acked_packets,
-                largest_newly_acked_info,
                 acked_new_largest_packet,
                 timestamp,
                 ecn_counts,
@@ -483,7 +490,7 @@ impl<Config: endpoint::Config> Manager<Config> {
     fn process_ack_range<Ctx: Context<Config>, Pub: event::ConnectionPublisher>(
         &mut self,
         newly_acked_packets: &mut SmallVec<
-            [SentPacketInfo<packet_info_type!()>; ACKED_PACKETS_INITIAL_CAPACITY],
+            [PacketDetails<packet_info_type!()>; ACKED_PACKETS_INITIAL_CAPACITY],
         >,
         timestamp: Timestamp,
         packet_number: PacketNumber,
@@ -507,14 +514,18 @@ impl<Config: endpoint::Config> Manager<Config> {
                 ack_range: pn_range.into_event(),
             });
 
-            context.validate_packet_ack(timestamp, &pn_range)?;
+            context.validate_packet_ack(
+                timestamp,
+                &pn_range,
+                self.sent_packets.get_range().start(),
+            )?;
             // notify components of packets acked
             context.on_packet_ack(timestamp, &pn_range);
 
             let mut newly_acked_range: Option<(PacketNumber, PacketNumber)> = None;
 
             for (packet_number, acked_packet_info) in self.sent_packets.remove_range(pn_range) {
-                newly_acked_packets.push(acked_packet_info);
+                newly_acked_packets.push((packet_number, acked_packet_info));
 
                 if largest_newly_acked.map_or(true, |(pn, _)| packet_number > pn) {
                     largest_newly_acked = Some((packet_number, acked_packet_info));
@@ -607,7 +618,7 @@ impl<Config: endpoint::Config> Manager<Config> {
             );
 
             // Notify components the RTT estimate was updated
-            context.on_rtt_update();
+            context.on_rtt_update(timestamp);
         }
     }
 
@@ -615,9 +626,8 @@ impl<Config: endpoint::Config> Manager<Config> {
     fn process_new_acked_packets<Ctx: Context<Config>, Pub: event::ConnectionPublisher>(
         &mut self,
         newly_acked_packets: &SmallVec<
-            [SentPacketInfo<packet_info_type!()>; ACKED_PACKETS_INITIAL_CAPACITY],
+            [PacketDetails<packet_info_type!()>; ACKED_PACKETS_INITIAL_CAPACITY],
         >,
-        largest_newly_acked: SentPacketInfo<packet_info_type!()>,
         new_largest_packet: bool,
         timestamp: Timestamp,
         ecn_counts: Option<EcnCounts>,
@@ -634,9 +644,10 @@ impl<Config: endpoint::Config> Manager<Config> {
         let current_path_id = context.path_id();
         let is_handshake_confirmed = context.is_handshake_confirmed();
         let mut current_path_acked_bytes = 0;
+        let mut current_path_largest_newly_acked = None;
         let mut newly_acked_ecn_counts = EcnCounts::default();
 
-        for acked_packet_info in newly_acked_packets {
+        for (packet_number, acked_packet_info) in newly_acked_packets {
             let path = context.path_mut_by_id(acked_packet_info.path_id);
 
             let sent_bytes = acked_packet_info.sent_bytes as usize;
@@ -644,6 +655,10 @@ impl<Config: endpoint::Config> Manager<Config> {
 
             if acked_packet_info.path_id == current_path_id {
                 current_path_acked_bytes += sent_bytes;
+
+                if current_path_largest_newly_acked.map_or(true, |(pn, _)| packet_number > pn) {
+                    current_path_largest_newly_acked = Some((packet_number, acked_packet_info));
+                }
             } else if sent_bytes > 0 {
                 path.congestion_controller.on_ack(
                     acked_packet_info.time_sent,
@@ -671,10 +686,6 @@ impl<Config: endpoint::Config> Manager<Config> {
             if path.is_peer_validated() {
                 path.reset_pto_backoff();
             }
-
-            if acked_packet_info.path_id != current_path_id {
-                self.update_pto_timer(path, timestamp, is_handshake_confirmed);
-            }
         }
 
         //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
@@ -686,7 +697,7 @@ impl<Config: endpoint::Config> Manager<Config> {
         // be restarted. This behavior is preferred, as detect_and_remove_lost_packets() will
         // cancel the loss timer, and there may still be ack eliciting packets pending that
         // require a PTO timer for recovery.
-        self.update_pto_timer(context.path_mut(), timestamp, is_handshake_confirmed);
+        self.update_pto_timer(context.active_path(), timestamp, is_handshake_confirmed);
 
         debug_assert!(
             !newly_acked_packets.is_empty(),
@@ -708,6 +719,8 @@ impl<Config: endpoint::Config> Manager<Config> {
         }
 
         if current_path_acked_bytes > 0 {
+            let (_, largest_newly_acked) = current_path_largest_newly_acked
+                .expect("At least some bytes were acknowledged on the current path");
             let path = context.path_mut();
             path.congestion_controller.on_ack(
                 largest_newly_acked.time_sent,
@@ -1065,8 +1078,10 @@ impl<Config: endpoint::Config> Manager<Config> {
     }
 
     #[inline]
-    fn check_consistency(&self, path: &Path<Config>, is_handshake_confirmed: bool) {
+    fn check_consistency(&self, active_path: &Path<Config>, is_handshake_confirmed: bool) {
         if cfg!(debug_assertions) {
+            assert!(active_path.is_active());
+
             let ack_eliciting_packets_in_flight = self
                 .sent_packets
                 .iter()
@@ -1077,13 +1092,13 @@ impl<Config: endpoint::Config> Manager<Config> {
             //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2.1
             //# it is the client's responsibility to send packets to unblock the server
             //# until it is certain that the server has finished its address validation
-            timer_required |= !path.is_peer_validated();
+            timer_required |= !active_path.is_peer_validated();
 
             //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2.1
             //# If no additional data can be sent, the server's PTO timer MUST NOT be
             //# armed until datagrams have been received from the client, because
             //# packets sent on PTO count against the anti-amplification limit.
-            timer_required &= !path.at_amplification_limit();
+            timer_required &= !active_path.at_amplification_limit();
 
             //= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.1
             //# An endpoint MUST NOT set its PTO timer for the Application Data
@@ -1125,6 +1140,10 @@ pub trait Context<Config: endpoint::Config> {
 
     fn is_handshake_confirmed(&self) -> bool;
 
+    fn active_path(&self) -> &Path<Config>;
+
+    fn active_path_mut(&mut self) -> &mut Path<Config>;
+
     fn path(&self) -> &Path<Config>;
 
     fn path_mut(&mut self) -> &mut Path<Config>;
@@ -1139,6 +1158,7 @@ pub trait Context<Config: endpoint::Config> {
         &mut self,
         timestamp: Timestamp,
         packet_number_range: &PacketNumberRange,
+        lowest_tracking_packet_number: PacketNumber,
     ) -> Result<(), transport::Error>;
 
     fn on_new_packet_ack<Pub: event::ConnectionPublisher>(
@@ -1152,7 +1172,7 @@ pub trait Context<Config: endpoint::Config> {
         packet_number_range: &PacketNumberRange,
         publisher: &mut Pub,
     );
-    fn on_rtt_update(&mut self);
+    fn on_rtt_update(&mut self, now: Timestamp);
 }
 
 impl<Config: endpoint::Config> transmission::interest::Provider for Manager<Config> {

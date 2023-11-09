@@ -381,6 +381,14 @@ impl<Config: endpoint::Config> ConnectionImpl<Config> {
             })
         }
 
+        if self.space_manager.handshake().is_some() && self.space_manager.is_handshake_confirmed() {
+            //= https://www.rfc-editor.org/rfc/rfc9001#section-4.9.2
+            //# An endpoint MUST discard its handshake keys when the TLS handshake is
+            //# confirmed (Section 4.1.2).
+            self.space_manager
+                .discard_handshake(&mut self.path_manager, &mut publisher);
+        }
+
         // check to see if we're flushing and should now close the connection
         if self.poll_flush().is_ready() {
             self.error?;
@@ -710,8 +718,6 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
 
         // We don't need any timers anymore
         self.timers.cancel();
-        // Let the path manager know we're closing
-        self.path_manager.on_closing();
         // Update the connection state based on the type of error
         self.state = error.into();
         self.error = Err(error);
@@ -792,13 +798,8 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
         //# sufficient information to identify packets for a closing connection;
         //# the endpoint MAY discard all other connection state.
         let mut publisher = self.event_context.publisher(timestamp, subscriber);
-        self.space_manager.close(
-            error,
-            self.path_manager.active_path_mut(),
-            active_path_id,
-            timestamp,
-            &mut publisher,
-        );
+        self.space_manager
+            .close(error, &mut self.path_manager, timestamp, &mut publisher);
     }
 
     /// Generates and registers new connection IDs using the given `ConnectionIdFormat`
@@ -1026,8 +1027,13 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
 
         let mut publisher = self.event_context.publisher(timestamp, subscriber);
 
-        self.path_manager
-            .on_timeout(timestamp, random_generator, &mut publisher)?;
+        let amplification_outcome =
+            self.path_manager
+                .on_timeout(timestamp, random_generator, &mut publisher)?;
+        if amplification_outcome.is_active_path_unblocked() {
+            self.space_manager
+                .on_amplification_unblocked(&self.path_manager, timestamp);
+        }
         self.local_id_registry.on_timeout(timestamp);
         self.space_manager.on_timeout(
             &mut self.local_id_registry,
@@ -1139,7 +1145,7 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
         //# size of packets it receives from that address.
         let handshake_confirmed = self.space_manager.is_handshake_confirmed();
 
-        let (id, unblocked) = self.path_manager.on_datagram_received(
+        let (id, amplification_outcome) = self.path_manager.on_datagram_received(
             path_handle,
             datagram,
             handshake_confirmed,
@@ -1152,6 +1158,16 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
         publisher.on_datagram_received(event::builder::DatagramReceived {
             len: datagram.payload_len as u16,
         });
+
+        if amplification_outcome.is_active_path_unblocked() {
+            //= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.6
+            //# When a server is blocked by anti-amplification limits, receiving a
+            //# datagram unblocks it, even if none of the packets in the datagram are
+            //# successfully processed.  In such a case, the PTO timer will need to
+            //# be re-armed.
+            self.space_manager
+                .on_amplification_unblocked(&self.path_manager, datagram.timestamp);
+        }
 
         if matches!(self.state, ConnectionState::Closing) {
             //= https://www.rfc-editor.org/rfc/rfc9000#section-10.2.1
@@ -1166,14 +1182,6 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
                 self.close_sender
                     .on_datagram_received(rtt, datagram.timestamp);
             }
-        } else if unblocked {
-            //= https://www.rfc-editor.org/rfc/rfc9002#appendix-A.6
-            //# When a server is blocked by anti-amplification limits, receiving a
-            //# datagram unblocks it, even if none of the packets in the datagram are
-            //# successfully processed.  In such a case, the PTO timer will need to
-            //# be re-armed.
-            self.space_manager
-                .on_amplification_unblocked(&self.path_manager[id], datagram.timestamp);
         }
 
         Ok(id)
@@ -1249,6 +1257,27 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
         if let Some((space, handshake_status)) = self.space_manager.initial_mut() {
             let mut publisher = self.event_context.publisher(datagram.timestamp, subscriber);
 
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+            //# A server MUST discard an Initial packet that is carried
+            //# in a UDP datagram with a payload that is smaller than the
+            //# smallest allowed maximum datagram size of 1200 bytes.
+            if Config::ENDPOINT_TYPE.is_server() && datagram.payload_len < 1200 {
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-14.1
+                //= type=exception
+                //= reason=A client may coalesce packets in a single datagram, which could be unintentionally split on path
+                //# A server MAY also immediately close the connection by
+                //# sending a CONNECTION_CLOSE frame with an error code of
+                //# PROTOCOL_VIOLATION; see Section 10.2.3.
+                let path = &self.path_manager[path_id];
+                publisher.on_packet_dropped(event::builder::PacketDropped {
+                    reason: event::builder::PacketDropReason::UndersizedInitialPacket {
+                        path: path_event!(path, path_id),
+                    },
+                });
+
+                return Err(ProcessingError::Other);
+            }
+
             //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2
             //= type=TODO
             //= tracking-issue=336
@@ -1301,6 +1330,8 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
         packet_interceptor: &mut Config::PacketInterceptor,
         datagram_endpoint: &mut Config::DatagramEndpoint,
     ) -> Result<(), ProcessingError> {
+        let mut publisher = self.event_context.publisher(datagram.timestamp, subscriber);
+
         //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.1
         //= type=TODO
         //= tracking-issue=337
@@ -1314,9 +1345,25 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
         //# receiving a server response, so servers SHOULD ignore any such
         //# packets.
 
-        if let Some((space, handshake_status)) = self.space_manager.handshake_mut() {
-            let mut publisher = self.event_context.publisher(datagram.timestamp, subscriber);
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-21.2
+        //# Except for Initial and Stateless Resets, an endpoint only accepts
+        //# packets that include a Destination Connection ID field that matches
+        //# a value the endpoint previously chose.
+        if datagram
+            .destination_connection_id_classification
+            .is_initial()
+        {
+            let path = &self.path_manager[path_id];
+            publisher.on_packet_dropped(event::builder::PacketDropped {
+                reason: event::builder::PacketDropReason::InitialConnectionIdInvalidSpace {
+                    path: path_event!(path, path_id),
+                    packet_type: event::builder::PacketType::Handshake,
+                },
+            });
+            return Err(ProcessingError::Other);
+        }
 
+        if let Some((space, handshake_status)) = self.space_manager.handshake_mut() {
             let packet = space.validate_and_decrypt_packet(
                 packet,
                 path_id,
@@ -1349,8 +1396,7 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
                 //# a server MUST discard Initial keys when it first
                 //# successfully processes a Handshake packet.
                 self.space_manager.discard_initial(
-                    self.path_manager.active_path_mut(),
-                    path_id,
+                    &mut self.path_manager,
                     datagram.timestamp,
                     &mut publisher,
                 );
@@ -1382,6 +1428,8 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
         subscriber: &mut Config::EventSubscriber,
         packet_interceptor: &mut Config::PacketInterceptor,
     ) -> Result<(), ProcessingError> {
+        let mut publisher = self.event_context.publisher(datagram.timestamp, subscriber);
+
         //= https://www.rfc-editor.org/rfc/rfc9001#section-5.7
         //# Endpoints in either role MUST NOT decrypt 1-RTT packets from
         //# their peer prior to completing the handshake.
@@ -1396,7 +1444,6 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
         //# process incoming 1-RTT protected packets before the TLS handshake is
         //# complete.
 
-        let mut publisher = self.event_context.publisher(datagram.timestamp, subscriber);
         if !self.space_manager.is_handshake_complete() {
             let path = &self.path_manager[path_id];
             publisher.on_packet_dropped(event::builder::PacketDropped {
@@ -1425,6 +1472,24 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
             //# anticipation of later packets that allow it to compute the key.
 
             return Ok(());
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-21.2
+        //# Except for Initial and Stateless Resets, an endpoint only accepts
+        //# packets that include a Destination Connection ID field that matches
+        //# a value the endpoint previously chose.
+        if datagram
+            .destination_connection_id_classification
+            .is_initial()
+        {
+            let path = &self.path_manager[path_id];
+            publisher.on_packet_dropped(event::builder::PacketDropped {
+                reason: event::builder::PacketDropReason::InitialConnectionIdInvalidSpace {
+                    path: path_event!(path, path_id),
+                    packet_type: event::builder::PacketType::OneRtt,
+                },
+            });
+            return Err(ProcessingError::Other);
         }
 
         if let Some((space, handshake_status)) = self.space_manager.application_mut() {
@@ -1477,7 +1542,7 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
     fn handle_version_negotiation_packet(
         &mut self,
         datagram: &DatagramInfo,
-        _path_id: path::Id,
+        path_id: path::Id,
         _packet: ProtectedVersionNegotiation,
         subscriber: &mut Config::EventSubscriber,
         _packet_interceptor: &mut Config::PacketInterceptor,
@@ -1510,6 +1575,24 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
         //= tracking-issue=349
         //# A client MUST discard a Version Negotiation packet that
         //# lists the QUIC version selected by the client.
+
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-21.2
+        //# Except for Initial and Stateless Resets, an endpoint only accepts
+        //# packets that include a Destination Connection ID field that matches
+        //# a value the endpoint previously chose.
+        if datagram
+            .destination_connection_id_classification
+            .is_initial()
+        {
+            let path = &self.path_manager[path_id];
+            publisher.on_packet_dropped(event::builder::PacketDropped {
+                reason: event::builder::PacketDropReason::InitialConnectionIdInvalidSpace {
+                    path: path_event!(path, path_id),
+                    packet_type: event::builder::PacketType::VersionNegotiation,
+                },
+            });
+            return Err(ProcessingError::Other);
+        }
 
         Ok(())
     }
@@ -1613,7 +1696,7 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
                     path: path_event!(path, path_id),
                 },
             });
-            return Err(ProcessingError::RetryScidEqualsDcid);
+            return Err(ProcessingError::Other);
         }
 
         let initial_cid = InitialId::try_from_bytes(path.peer_connection_id.as_ref())
