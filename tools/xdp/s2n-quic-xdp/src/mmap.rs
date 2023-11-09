@@ -47,6 +47,12 @@ impl Mmap {
             len: existing_mmap.len(),
         }
     }
+
+    pub fn from_raw_parts(addr: *mut c_void, len: usize) -> Mmap {
+        let addr = unsafe { NonNull::new_unchecked(addr) };
+
+        Mmap { addr, len }
+    }
 }
 
 impl Deref for Mmap {
