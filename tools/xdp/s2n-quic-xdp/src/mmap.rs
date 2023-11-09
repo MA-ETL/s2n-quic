@@ -38,6 +38,15 @@ impl Mmap {
     pub fn addr(&self) -> NonNull<c_void> {
         self.addr
     }
+
+    pub fn convert(existing_mmap: std::sync::Arc<memmap2::MmapRaw>) -> Mmap {
+        let addr = unsafe { NonNull::new_unchecked(existing_mmap.as_mut_ptr() as *mut c_void) };
+
+        Mmap {
+            addr,
+            len: existing_mmap.len(),
+        }
+    }
 }
 
 impl Deref for Mmap {

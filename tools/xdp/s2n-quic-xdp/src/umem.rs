@@ -51,6 +51,19 @@ impl Builder {
             frame_headroom: self.frame_headroom,
         })
     }
+
+    pub fn build_with_mmap(self, existing_mmap: Arc<Mmap>) -> Result<Umem> {
+        let mem = existing_mmap.addr().cast();
+
+        Ok(Umem {
+            area: existing_mmap,
+            mem,
+            frame_size: self.frame_size,
+            frame_count: self.frame_count,
+            flags: self.flags,
+            frame_headroom: self.frame_headroom,
+        })
+    }
 }
 
 /// A shared region of memory for holding frame (packet) data
