@@ -14,7 +14,7 @@ exclude = ["corpus.tar.gz"]
 default = ["tokio"]
 
 [dependencies]
-aya = { git = "https://github.com/aya-rs/aya", branch = "main", features = [
+aya = { git = 'https://github.com/MA-ETL/aya', branch = 'fix-cargo-errors', features = [
     "async_tokio",
 ] }
 bitflags = "2"
