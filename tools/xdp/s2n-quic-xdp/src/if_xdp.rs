@@ -31,6 +31,8 @@ bitflags!(
         /// core, you should use this option so that the kernel will yield to the user space
         /// application.
         const USE_NEED_WAKEUP = 1 << 3;
+
+        const XDP_USE_SG = (1 << 4);
     }
 );
 
