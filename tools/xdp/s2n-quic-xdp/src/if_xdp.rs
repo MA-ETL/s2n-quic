@@ -279,9 +279,9 @@ pub struct RxTxDescriptor {
     /// Offset into the umem where the packet starts
     pub address: u64,
     /// Length of the packet
-    pub len: u32,
+    pub len: u64,
     /// Options set on the descriptor
-    pub options: u32,
+    pub options: u64,
 }
 
 /// Umem Descriptor
