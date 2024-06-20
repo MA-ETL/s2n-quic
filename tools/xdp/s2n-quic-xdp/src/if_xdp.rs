@@ -304,6 +304,7 @@ impl UmemDescriptor {
             address: self.address,
             len,
             options: 0,
+            extended_options: 0,
         }
     }
 }
