@@ -282,8 +282,12 @@ pub struct RxTxDescriptor {
     pub len: u32,
     /// Options set on the descriptor
     pub options: u32,
-    /// Extended options
-    pub extended_options: u64,
+    /// GSO offset options
+    pub gso_offsets: u32,
+    /// Integer Timestamp
+    pub integer_timestamp: u32,
+    /// Fractional Timestamp
+    pub factional_timestamp: u64,
 }
 
 /// Umem Descriptor
@@ -304,7 +308,9 @@ impl UmemDescriptor {
             address: self.address,
             len,
             options: 0,
-            extended_options: 0,
+            gso_offsets: 0,
+            integer_timestamp: 0,
+            factional_timestamp: 0,
         }
     }
 }
