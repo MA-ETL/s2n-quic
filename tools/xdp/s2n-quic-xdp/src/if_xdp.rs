@@ -287,7 +287,7 @@ pub struct RxTxDescriptor {
     /// Integer Timestamp
     pub integer_timestamp: u32,
     /// Fractional Timestamp
-    pub factional_timestamp: u64,
+    pub fractional_timestamp: u64,
 }
 
 /// Umem Descriptor
