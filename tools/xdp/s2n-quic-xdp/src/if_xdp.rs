@@ -310,7 +310,7 @@ impl UmemDescriptor {
             options: 0,
             gso_options: 0,
             integer_timestamp: 0,
-            factional_timestamp: 0,
+            fractional_timestamp: 0,
         }
     }
 }
